@@ -1,0 +1,8 @@
+h5py
+numpy
+torch>=1.0
+torchvision
+enum34
+future
+pykeops
+geomloss
