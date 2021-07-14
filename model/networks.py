@@ -7,6 +7,7 @@ from __future__ import (
 )
 import time
 import math
+import random
 import torch
 import torch.nn as nn
 import numpy as np
@@ -145,15 +146,15 @@ class res_gcn_block(nn.Module):
     def forward(self, points, indices=None):
         shortcut = points
         features = points
-        features = self.relu(features)
+        features = self.relu(features)#[8,128,393]
         grouped_points = utils.grouping_operation(features,
-                                                  indices.detach())
-        center_points = torch.unsqueeze(features, 3)
+                                                  indices.detach())#[8,128,393,8]
+        center_points = torch.unsqueeze(features, 3)#[8,128,393,1]
         if self.need_conv:
-            features = self.conv1(center_points)
-            grouped_points_nn = self.conv2(grouped_points)
-            features = torch.cat([features, grouped_points_nn], 3)
-            features = torch.mean(features, 3, keepdim=False) + shortcut
+            features = self.conv1(center_points)#[8,128,393,1]
+            grouped_points_nn = self.conv2(grouped_points)#[8,128,393,8]
+            features = torch.cat([features, grouped_points_nn], 3)#[8,128,393,9]
+            features = torch.mean(features, 3, keepdim=False) + shortcut#shortcut[8,128,393],[8,128,393]
         del shortcut
         if self.need_conv:
             return features, center_points, grouped_points, grouped_points_nn
@@ -507,11 +508,13 @@ class res_gcn_up(nn.Module):
             self.max_ratio = 3
         self.conv3 = nn.Conv2d(n_cout, 3 * self.max_ratio, kernel_size=(1, 1), stride=(1, 1), bias=False)
         self.conv4 = nn.Conv2d(n_cout, 3 * self.max_ratio, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        self.conv5 = nn.Conv2d(3, 128, kernel_size=(1, 1), stride=(1, 1), bias=False)
+        self.conv6 = nn.Conv2d(128, 3, kernel_size=(1, 1), stride=(1, 1), bias=False)
         if self.withmetamask:
             self.metamask = MiniImagenetCNN(output_size=None,
                                             hidden_size=3*self.max_ratio, layers=2)
 
-    def forward(self, xyz, points, up_scale, mask, Nout=0, indices=None):
+    def forward(self, xyz, points, up_scale, mask, Nout=0, indices=None):#xyz[8,256,3],points[8,128,256]
         shortcut = points
         features = points
         if Nout == 0:
@@ -520,11 +523,10 @@ class res_gcn_up(nn.Module):
         #第一个RGC模块开始
         features = self.relu(features)#[8,218,n]
         if indices is None:
-            _, grouped_points, self.indices = group(xyz.detach(), features, self.k)#grouped_points[8,128,n,8],indics[8,n,8]
-        else:
+            _, grouped_points, self.indices = group(xyz.detach(), features, self.k)#grouped_points[8,128,n,8],indics[8,n,8],xyz[8,n,3],features[8,128,n]
+        else:#该分支不会发生
             self.indices = indices.detach()
-            grouped_points = utils.grouping_operation(features,
-                                                      self.indices)
+            grouped_points = utils.grouping_operation(features,self.indices)
         center_points = torch.unsqueeze(features, 3)#对总的进行1*1卷积center_points[8,128,422,1],features[8,128,422,1]
         features = self.conv1(center_points)
         del center_points
@@ -542,7 +544,7 @@ class res_gcn_up(nn.Module):
         reg_loss=np.zeros(1)
         # print("reg_loss={}".format(type(reg_loss)))
 
-
+        #一系列RGC模块
         for i, block in enumerate(self.block_list):
             if self.drop_last_conv:
                 features, _, _, _ = block(features, self.indices.detach())#输入输出均是[8,128,1144]
@@ -552,31 +554,86 @@ class res_gcn_up(nn.Module):
                 else:
                     #[8,128,422] [8,128,422,1] [8,128,422,8] [8,128,422,8]
                     features, center_points_, grouped_points_, grouped_points_nn_ = block(features,
-                                                                                          self.indices.detach())#
+                                                                                          self.indices.detach())
+
+        #添加插值
+        import random
+        #坐标插值,插值出的新点存在new_point中
+        interpolation_grouped_points = utils.grouping_operation(xyz.transpose(2,1).contiguous(),self.indices.detach())#[8,3,n,8],xyz[8,n.3]
+        interpolation_max_distance,idx=torch.max(interpolation_grouped_points.detach()-torch.unsqueeze(xyz.transpose(2,1),3),3)#注意max的返回值有两个，少了index，会报错。interpolation_grouped_points[8,3,2220]
+        del interpolation_grouped_points,idx
+        interpolation_up_scale=math.ceil(up_scale)
+        new_point = None
+        for i in range(1, interpolation_up_scale):
+            noise = random.random()
+            noise=1 if noise>0.5 else -1
+            if new_point == None:
+                new_point = noise*i / interpolation_up_scale * interpolation_max_distance + xyz.transpose(2,1)
+            else:
+                new_point = torch.cat((new_point, noise*i / interpolation_up_scale * interpolation_max_distance + xyz.transpose(2,1)), 2)
+        del interpolation_max_distance
+        #特征插值,插值出的新特征存在new_features
+        grouped_points = utils.grouping_operation(features,self.indices)#features[8,128,671],indices[8,671,8],grouped_points[8,128,671,8]
+        new_features = None
+        for i in range(1, interpolation_up_scale):
+            if new_features == None:
+                new_features = grouped_points.mean(3)
+            else:
+                new_features = torch.cat((new_features, grouped_points.mean(3)),2)
+        del grouped_points
+        #将新点加到旧点后面
+        new_point = torch.cat((xyz, new_point.transpose(2, 1)), 1)#2倍后[8，4440，3]
+        new_features = torch.cat((features, new_features), 2)#[8,128,4440]
+
+        # 位置编码成128与特征拼接相加，得到新特征
+        # grouped_points = torch.cat((utils.grouping_operation(new_point.transpose(2,1).contiguous(), self.indices.detach()),new_point.transpose(2,1).unsqueeze(3)),3)#[8,3,n,9]
+        shortcut1 = self.conv5(new_point.transpose(2, 1).unsqueeze(3))  # in[8,1380,3],out[8,128,1380,1]
+        new_features = new_features + torch.squeeze(shortcut1,3)
+        del shortcut1
+
+        # # 一系列RGC模块
+        # _, grouped_points, self.indices = group(new_point, new_features, self.k)#从新计算索引.grouped_points[8,128,4440,8],indices[8,4440,8]
+        # for i, block in enumerate(self.block_list):
+        #     if self.drop_last_conv:
+        #         new_features, _, _, _ = block(new_features, self.indices.detach())  # 输入输出均是[8,128,1144]
+        #     else:
+        #         if i < self.n_blocks - 1:
+        #             new_features, _, _, _ = block(new_features, self.indices.detach())
+        #         else:
+        #             # [8,128,422] [8,128,422,1] [8,128,422,8] [8,128,422,8]
+        #             new_features, center_points_, grouped_points_, grouped_points_nn_ = block(new_features,
+        #                                                                                   self.indices.detach())
+        # #new_point[8,4440,3],new_features[8,128,4440]
+
+        #由特征回归出点
+        new_features=self.conv6(new_features.unsqueeze(3))
+        new_features=torch.squeeze(new_features,3)
+        new_xyz = (new_features.transpose(2,1) + new_point).contiguous()  # [8,1293*5,3]=[8,6465,3]
 
 
-        if self.drop_last_conv:
-            _, center_points_, grouped_points_, _ = self.last_block(features, self.indices.detach())
-        points_xyz = self.conv3(center_points_)#1*1卷积，由[8,128,1293,1]变成[8,15,1293,1]
-        grouped_points_xyz = self.conv4(grouped_points_)#1*1卷积，由[8,128,1293,8]变成[8,15,1293,8]
-        del center_points_, grouped_points_
-        #unpooling模块
-        new_xyz = torch.mean(torch.cat([points_xyz, grouped_points_xyz], 3), 3,
-                             keepdim=True).transpose(2,1).contiguous()#[8,1293,15,1]
-        del points_xyz, grouped_points_xyz
-        new_xyz = new_xyz.view(new_xyz.shape[0],xyz.shape[1],self.max_ratio,3).contiguous()
-        if self.withmetamask:
-            mask_t = (mask.float() + (1.0 / 8.0)) / (5.0 / 4.0)
-            metamask = self.metamask(mask_t.view(1, 3, -1, 1).contiguous().detach()).view(1, 9,
-                                                                                          -1).contiguous()
-            xyz *= metamask.transpose(2, 1).contiguous().view(1,-1,3).contiguous()
-
-        new_xyz = (new_xyz+torch.unsqueeze(xyz,2)).view(new_xyz.shape[0],-1,3).contiguous()#[8,1293*5,3]=[8,6465,3]
-        # unpooling模块结束
+        # #npooling模块开始
+        # if self.drop_last_conv:
+        #     _, center_points_, grouped_points_, _ = self.last_block(features, self.indices.detach())
+        # points_xyz = self.conv3(center_points_)#1*1卷积，由[8,128,1293,1]变成[8,15,1293,1]
+        # grouped_points_xyz = self.conv4(grouped_points_)#1*1卷积，由[8,128,1293,8]变成[8,15,1293,8]
+        # del center_points_, grouped_points_
+        # #unpooling模块的后半段，group与全局的特征提取完
+        # new_xyz = torch.mean(torch.cat([points_xyz, grouped_points_xyz], 3), 3,
+        #                      keepdim=True).transpose(2,1).contiguous()#[8,1293,15,1]
+        # del points_xyz, grouped_points_xyz
+        # new_xyz = new_xyz.view(new_xyz.shape[0],xyz.shape[1],self.max_ratio,3).contiguous()
+        # if self.withmetamask:
+        #     mask_t = (mask.float() + (1.0 / 8.0)) / (5.0 / 4.0)
+        #     metamask = self.metamask(mask_t.view(1, 3, -1, 1).contiguous().detach()).view(1, 9,
+        #                                                                                   -1).contiguous()
+        #     xyz *= metamask.transpose(2, 1).contiguous().view(1,-1,3).contiguous()
+        #
+        # new_xyz = (new_xyz+torch.unsqueeze(xyz,2)).view(new_xyz.shape[0],-1,3).contiguous()#[8,1293*5,3]=[8,6465,3]
+        # # unpooling模块结束
 
         #最远点采样
         if mask is None:
-            new_pred = new_xyz.transpose(1, 2).contiguous()
+            new_pred = new_xyz.transpose(1, 2).contiguous()#new_xyz[8,1436,3],new_pred[8,3,1436]
             new_xyz = utils.gather_operation(new_pred, utils.furthest_point_sample(new_xyz, Nout).detach()).transpose(1, 2).contiguous()#采样结果[8,4093,3]
             del new_pred
         else:
@@ -584,7 +641,7 @@ class res_gcn_up(nn.Module):
                                                                                3).contiguous()
             del mask
 
-        return new_xyz, features+shortcut,reg_loss
+        return new_xyz.contiguous(), (features+shortcut).contiguous(),reg_loss
 
 
 def get_uniform_loss(pcd, percentages=[0.004,0.008,0.010,0.012,0.016], radius=1.0, device=None):

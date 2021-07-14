@@ -39,7 +39,7 @@ parser.add_argument('--log_dir', default='model/new', help='Log dir')
 parser.add_argument('--num_point', type=int, default=1024, help='Point Number [1024] [default: 1024]')
 parser.add_argument('--up_ratio', type=int, default=4, help='Upsampling Ratio [default: 4]')
 parser.add_argument('--max_epoch', type=int, default=60, help='Epoch to run [default: 80]')#default=80
-parser.add_argument('--batch_size', type=int, default=8, help='Batch Size during training [default: 24]')
+parser.add_argument('--batch_size', type=int, default=1, help='Batch Size during training [default: 24]')
 # parser.add_argument('--batch_size', type=int, default=24, help='Batch Size during training [default: 24]')
 parser.add_argument('--learning_rate', type=float, default=0.0001)
 parser.add_argument('--dataset', default='model/data/Patches_noHole_and_collected.h5')#default=None
@@ -239,6 +239,7 @@ def train(assign_model_path=None, bn_decay=0.95):
     #     print('=============================')
     # # print(g_model)
     # print("model完毕")
+    torch.backends.cudnn.enabled = False
     for epoch in tqdm(range(restore_epoch, MAX_EPOCH + 1), ncols=55):
         g_scheduler.step()
         # g_fc_scheduler.step()
@@ -249,7 +250,7 @@ def train(assign_model_path=None, bn_decay=0.95):
             pointclouds_pl, pointclouds_gt, radius, this_scale = sample_batched#[1,8,999,6][1,8,4095,6],[1,8],[1]=4.1
             this_scale = this_scale[0].numpy() - (1e-05)
             pointclouds_pl, pointclouds_gt, radius = pointclouds_pl[0].cuda(non_blocking=True,device=device), pointclouds_gt[0].cuda(
-                non_blocking=True,device=device), radius[0].cuda(non_blocking=True,device=device)
+                non_blocking=True,device=device), radius[0].cuda(non_blocking=True,device=device)#[8,999,6][8,4096,6]
 
             assert pointclouds_pl.shape[0] > 0 and pointclouds_pl.shape[1] > 10
             pointclouds_gt = pointclouds_gt[:, :, 0:3]
